@@ -1,8 +1,10 @@
 import sys
 import os
+import time
 import psutil
 import json
 import webbrowser
+import shutil
 from PySide6.QtWidgets import (
     QApplication, QLabel, QVBoxLayout, QWidget,
     QDialog, QCheckBox, QComboBox, QPushButton, QLabel as QLab,
@@ -12,6 +14,117 @@ from PySide6.QtCore import Qt, QTimer, QRect, QPoint, QPropertyAnimation, QEasin
 from PySide6.QtGui import QFont, QIcon, QCursor, QAction
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from pynvml import *
+import subprocess
+import ctypes
+import threading
+
+# --------- 配置管理 ---------
+user32 = ctypes.windll.user32
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "CPNya")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PRESENTMON_NAME = "PresentMon.exe"
+PRESENTMON_DEST = os.path.join(CONFIG_DIR, PRESENTMON_NAME)
+
+dwm_mode = False
+
+
+if sys.platform == "win32":
+    CREATE_NO_WINDOW = 0x08000000
+else:
+    CREATE_NO_WINDOW = 0
+
+def get_foreground_window_pid():
+    hwnd = user32.GetForegroundWindow()
+    pid = ctypes.c_ulong()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+def ensure_presentmon_in_appdata():
+    if os.path.exists(PRESENTMON_DEST):
+        return True
+    src = resource_path(PRESENTMON_NAME)
+    if os.path.exists(src):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            shutil.copy2(src, PRESENTMON_DEST)
+        except Exception:
+            pass
+        return True
+
+
+class PresentMonRunner:
+    def __init__(self):
+        self.process = None
+        self.running = False
+        self.current_fps = 0
+        self.check_timeout_running = False
+
+    def start(self, pid):
+        ok = ensure_presentmon_in_appdata()
+        if not ok:
+            print("[ERROR] PresentMon.exe 未找到，FPS 功能不可用")
+            return
+        print(f"[DEBUG] PRESENTMON_DEST: {PRESENTMON_DEST}")
+        self.stop()
+        self.process = subprocess.Popen(
+            [PRESENTMON_DEST, '--stop_existing_session', '--process_id', str(pid), '--output_stdout'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            creationflags=CREATE_NO_WINDOW
+        )
+        self.running = True
+        self.check_timeout_running = True
+        self.last_output_time = time.time()
+        threading.Thread(target=self._read_output, daemon=True).start()
+        threading.Thread(target=self._check_timeout, daemon=True).start()
+
+    def _read_output(self):
+        try:
+            for line in self.process.stdout:
+                self.last_output_time = time.time()
+                fields = line.strip().split(",")
+                if len(fields) > 10:
+                    frame_time_str = fields[10]
+                    try:
+                        frame_time = float(frame_time_str)
+                        self.current_fps = 1000 / frame_time
+                    except ValueError:
+                        pass
+        except Exception as e:
+            print(f"[ERROR] 读取 PresentMon 输出出错: {e}")
+
+    def _check_timeout(self):
+        while self.check_timeout_running:
+            if time.time() - self.last_output_time > 1:
+                print("[INFO] PID模式超时，切换到dwm.exe进程模式")
+                self.stop()
+                self.process = subprocess.Popen(
+                    [PRESENTMON_DEST, '--stop_existing_session', '--process_name', 'dwm.exe', '--output_stdout'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    creationflags=CREATE_NO_WINDOW
+                )
+                global dwm_mode
+                dwm_mode = True
+                self.last_output_time = time.time()
+                threading.Thread(target=self._read_output, daemon=True).start()
+                break
+            time.sleep(0.1)
+
+    def stop(self):
+        global dwm_mode
+        dwm_mode = False
+        self.check_timeout_running = False
+        if self.process and self.running:
+            self.process.terminate()
+            self.process.wait()
+            self.running = False
 
 # --------- 单实例检测 ---------
 def is_another_instance_running(key="OverlaySingleton"):
@@ -30,10 +143,6 @@ def create_instance_lock(key="OverlaySingleton"):
         server.listen(key)
     return server
 
-# --------- 配置管理 ---------
-CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "CPNya")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-
 def load_config():
     cfg = {}
     if os.path.exists(CONFIG_FILE):
@@ -46,6 +155,7 @@ def load_config():
     cfg.setdefault('show_gpu', True)
     cfg.setdefault('show_temp', True)
     cfg.setdefault('show_vram', True)
+    cfg.setdefault('show_fps', True)
     cfg.setdefault('memory_unit', 'GB')
     # overlay 位置
     pos = cfg.get('overlay_pos')
@@ -77,6 +187,17 @@ def color_smooth_gradient(percent: float) -> str:
         r,g,b = lerp_color(yellow, orange, (p-1/3)/(1/3))
     else:
         r,g,b = lerp_color(orange, red, (p-2/3)/(1/3))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+def color_reverse_gradient(percent: float) -> str:
+    p = max(0, min(percent, 100)) / 100.0
+    red, orange, yellow, green = (255,0,0),(255,165,0),(255,255,0),(0,255,0)
+    if p <= 1/3:
+        r,g,b = lerp_color(red, orange, p/(1/3))
+    elif p <= 2/3:
+        r,g,b = lerp_color(orange, yellow, (p-1/3)/(1/3))
+    else:
+        r,g,b = lerp_color(yellow, green, (p-2/3)/(1/3))
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
@@ -114,6 +235,7 @@ class SettingsDialog(QDialog):
         self.gpu_checkbox    = QCheckBox("显示 GPU 信息")
         self.temp_checkbox   = QCheckBox("显示 GPU 温度")
         self.vram_checkbox   = QCheckBox("显示 VRAM 信息")
+        self.fps_checkbox     = QCheckBox("显示 FPS 信息")
         self.unit_combo      = QComboBox()
         self.unit_combo.addItems(["GB", "MB"])
 
@@ -124,6 +246,7 @@ class SettingsDialog(QDialog):
             self.gpu_checkbox.setChecked(config.get("show_gpu", True))
             self.temp_checkbox.setChecked(config.get("show_temp", True))
             self.vram_checkbox.setChecked(config.get("show_vram", True))
+            self.fps_checkbox.setChecked(config.get("show_fps", True))
             unit = config.get("memory_unit", "GB")
             idx = self.unit_combo.findText(unit)
             self.unit_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -138,7 +261,7 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout()
         for w in (self.cpu_checkbox, self.percore_checkbox, self.memory_checkbox,
-                  self.gpu_checkbox, self.temp_checkbox, self.vram_checkbox):
+                  self.gpu_checkbox, self.temp_checkbox, self.vram_checkbox, self.fps_checkbox):
             layout.addWidget(w)
             w.toggled.connect(self.update_overlay_preview)
         layout.addSpacing(10)
@@ -166,6 +289,7 @@ class SettingsDialog(QDialog):
             'show_gpu':     self.gpu_checkbox.isChecked(),
             'show_temp':    self.temp_checkbox.isChecked(),
             'show_vram':    self.vram_checkbox.isChecked(),
+            'show_fps':     self.fps_checkbox.isChecked(),
             'memory_unit':  self.unit_combo.currentText()
         }
 
@@ -298,6 +422,24 @@ class OverlayWindow(QWidget):
             else:
                 parts.append("VRAM: <span style='color:gray;'>N/A</span>")
 
+        if self.settings['show_fps']:
+            if not hasattr(self, 'pm_runner'):
+                self.pm_runner = PresentMonRunner()
+                self.last_pid = None
+            
+            current_pid = get_foreground_window_pid()
+            if current_pid != self.last_pid:
+                self.pm_runner.current_fps = 0
+                self.pm_runner.start(current_pid)
+                self.last_pid = current_pid
+            
+            fps = self.pm_runner.current_fps
+            fps_color = fps / 60 * 100 if fps > 0 else 0
+            fps_str = f"FPS: <span style='color:{color_reverse_gradient(fps_color)};'>{fps:.0f}</span>"
+            if dwm_mode is True:
+                fps_str += " <span style='color:white;'>(dwm.exe)</span>"
+            parts.append(fps_str)
+
         self.label.setText("<br>".join(parts))
         self.label.adjustSize()
         self.adjustSize()
@@ -324,6 +466,8 @@ class OverlayWindow(QWidget):
     def closeEvent(self, event):
         if getattr(self, 'gpu_available', False):
             nvmlShutdown()
+        if hasattr(self, 'pm_runner'):
+            self.pm_runner.stop()
         event.accept()
 
 # --------- 托盘图标 with Settings ---------
