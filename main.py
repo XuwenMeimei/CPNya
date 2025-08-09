@@ -5,6 +5,7 @@ import psutil
 import json
 import webbrowser
 import shutil
+import darkdetect
 from PySide6.QtWidgets import (
     QApplication, QLabel, QVBoxLayout, QWidget,
     QDialog, QCheckBox, QComboBox, QPushButton, QLabel as QLab,
@@ -157,6 +158,7 @@ def load_config():
     cfg.setdefault('show_vram', True)
     cfg.setdefault('show_fps', True)
     cfg.setdefault('memory_unit', 'GB')
+    cfg.setdefault('position_preset', '左上')
     # overlay 位置
     pos = cfg.get('overlay_pos')
     if not isinstance(pos, list) or len(pos) != 2:
@@ -219,8 +221,21 @@ class SettingsDialog(QDialog):
         super().__init__()
         self.overlay = overlay
         self.setWindowTitle("设置")
-        self.setFixedSize(300, 300)
-        self.setStyleSheet("""
+        self.setFixedSize(300,400)
+
+        if darkdetect.isDark():
+            #深色模式
+            self.setStyleSheet("""
+            QDialog { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #3a2c34, stop:1 #1f1b1e); border-radius: 15px; }
+            QCheckBox { spacing: 8px; font-size: 14px; color: #ddd; }
+            QCheckBox::indicator { width: 18px; height: 18px; }
+            QComboBox { padding: 4px; font-size: 14px; border: 2px solid #a86479; border-radius: 8px; background-color: #4b3a42; color: #ddd; }
+            QPushButton { padding: 6px 12px; font-size: 14px; border-radius: 12px; background-color: #a86479; color: #fff; }
+            QPushButton:hover { background-color: #944a63; }
+        """)
+        else:
+            #浅色模式
+            self.setStyleSheet("""
             QDialog { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ffe6f2, stop:1 #fffbf7); border-radius: 15px; }
             QCheckBox { spacing: 8px; font-size: 14px; }
             QCheckBox::indicator { width: 18px; height: 18px; }
@@ -236,8 +251,12 @@ class SettingsDialog(QDialog):
         self.temp_checkbox   = QCheckBox("显示 GPU 温度")
         self.vram_checkbox   = QCheckBox("显示 VRAM 信息")
         self.fps_checkbox     = QCheckBox("显示 FPS 信息")
+        self.pos_combo       = QComboBox()
+        self.pos_combo.addItems(["左上", "左下", "右上", "右下"])
         self.unit_combo      = QComboBox()
         self.unit_combo.addItems(["GB", "MB"])
+        self.pos_hint_label = QLabel("左下/右下 建议配合自动隐藏任务栏使用哦~")
+        self.pos_hint_label.setStyleSheet("color: gray; font-size: 10pt;")
 
         if config:
             self.cpu_checkbox.setChecked(config.get("show_cpu", True))
@@ -247,13 +266,17 @@ class SettingsDialog(QDialog):
             self.temp_checkbox.setChecked(config.get("show_temp", True))
             self.vram_checkbox.setChecked(config.get("show_vram", True))
             self.fps_checkbox.setChecked(config.get("show_fps", True))
+            pos = config.get("position_preset", "左上")
+            idx_pos = self.pos_combo.findText(pos)
             unit = config.get("memory_unit", "GB")
             idx = self.unit_combo.findText(unit)
+            self.pos_combo.setCurrentIndex(idx_pos if idx_pos >= 0 else 0)
             self.unit_combo.setCurrentIndex(idx if idx >= 0 else 0)
         else:
             for cb in (self.cpu_checkbox, self.percore_checkbox, self.memory_checkbox,
-                       self.gpu_checkbox, self.temp_checkbox, self.vram_checkbox):
+                       self.gpu_checkbox, self.temp_checkbox, self.vram_checkbox, self.fps_checkbox):
                 cb.setChecked(True)
+            self.pos_combo.setCurrentIndex(0)
             self.unit_combo.setCurrentIndex(0)
 
         ok_btn = QPushButton("确定")
@@ -265,12 +288,18 @@ class SettingsDialog(QDialog):
             layout.addWidget(w)
             w.toggled.connect(self.update_overlay_preview)
         layout.addSpacing(10)
-        layout.addWidget(QLab("内存 单位:"))
+        layout.addWidget(QLab("位置预设:"))
+        layout.addWidget(self.pos_combo)
+        self.pos_combo.currentTextChanged.connect(self.update_overlay_preview)
+        layout.addSpacing(10)
+        layout.addWidget(QLab("内存单位:"))
         layout.addWidget(self.unit_combo)
         self.unit_combo.currentTextChanged.connect(self.update_overlay_preview)
         layout.addStretch()
+        layout.addWidget(self.pos_hint_label, alignment=Qt.AlignCenter)
         layout.addWidget(ok_btn, alignment=Qt.AlignCenter)
         self.setLayout(layout)
+        
 
         # 标记对话框打开
         if self.overlay:
@@ -282,7 +311,7 @@ class SettingsDialog(QDialog):
             self.overlay.update_info()
 
     def get_settings(self):
-        return {
+        settings = {
             'show_cpu':     self.cpu_checkbox.isChecked(),
             'show_percore': self.percore_checkbox.isChecked(),
             'show_memory':  self.memory_checkbox.isChecked(),
@@ -290,8 +319,10 @@ class SettingsDialog(QDialog):
             'show_temp':    self.temp_checkbox.isChecked(),
             'show_vram':    self.vram_checkbox.isChecked(),
             'show_fps':     self.fps_checkbox.isChecked(),
-            'memory_unit':  self.unit_combo.currentText()
+            'memory_unit':  self.unit_combo.currentText(),
+            'position_preset': self.pos_combo.currentText()
         }
+        return settings
 
     def accept(self):
         settings = self.get_settings()
@@ -340,10 +371,6 @@ class OverlayWindow(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
 
-        # 初始位置
-        x, y = settings.get('overlay_pos', [10,10])
-        self.orig_pos = QPoint(x, y)
-
         # Label
         f = QFont("Segoe UI", 10)
         f.setStyleStrategy(QFont.PreferAntialias)
@@ -354,7 +381,8 @@ class OverlayWindow(QWidget):
             QLabel { color: white; background-color: rgba(0,0,0,128);
             border-radius: 12px; padding: 10px; font-family: 'Comic Sans MS'; }
         """)
-        self.label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.label)
@@ -376,8 +404,48 @@ class OverlayWindow(QWidget):
         self.mouse_timer.start(100)
 
         self.update_info()
-        self.move(self.orig_pos)
+
+        self.adjustSize()
+        geo = self.frameGeometry()
+        screen_geo = QApplication.primaryScreen().geometry()
+
+        preset = self.settings.get('position_preset')
+        if preset == "左上":
+            geo.moveTopLeft(QPoint(10, 10))
+        elif preset == "左下":
+            geo.moveBottomLeft(QPoint(10, screen_geo.bottom() - 10))
+        elif preset == "右上":
+            geo.moveTopRight(QPoint(screen_geo.right() - 10, 10))
+        elif preset == "右上":
+            geo.moveTopRight(QPoint(screen_geo.right() - 10, 10))
+        elif preset == "右下":
+            geo.moveBottomRight(QPoint(screen_geo.right() - 10, screen_geo.bottom() - 10))
+        else:
+            geo.moveTopLeft(QPoint(10, 10))
+
+        self.setGeometry(geo)
+        self.orig_pos = self.pos()
+
         self.show()
+
+    def adjust_position(self):
+        self.adjustSize()
+        geo = self.frameGeometry()
+        screen_geo = QApplication.primaryScreen().geometry()
+
+        preset = self.settings.get('position_preset')
+        if preset == "左上":
+            geo.moveTopLeft(QPoint(10, 10))
+        elif preset == "左下":
+            geo.moveBottomLeft(QPoint(10, screen_geo.bottom() - 10))
+        elif preset == "右上":
+            geo.moveTopRight(QPoint(screen_geo.right() - 10, 10))
+        elif preset == "右下":
+            geo.moveBottomRight(QPoint(screen_geo.right() - 10, screen_geo.bottom() - 10))
+
+        self.setGeometry(geo)
+        self.orig_pos = self.pos()
+
 
     def update_info(self):
         parts = []
@@ -441,6 +509,7 @@ class OverlayWindow(QWidget):
             parts.append(fps_str)
 
         self.label.setText("<br>".join(parts))
+        self.adjust_position()
         self.label.adjustSize()
         self.adjustSize()
 
@@ -449,11 +518,16 @@ class OverlayWindow(QWidget):
             return
         pos = QCursor.pos()
         m = 10
-        r = QRect(self.orig_pos.x(), self.orig_pos.y(), self.width(), self.height()).adjusted(-m,-m,m,m)
+        r = QRect(self.orig_pos.x(), self.orig_pos.y(), self.width(), self.height()).adjusted(-m, -m, m, m)
+        preset = self.settings.get('position_preset')
         if not self.hidden and r.contains(pos):
             self.anim.stop()
             self.anim.setStartValue(self.pos())
-            self.anim.setEndValue(QPoint(-self.width(), self.orig_pos.y()))
+            if preset in ("左上", "左下"):
+                self.anim.setEndValue(QPoint(-self.width(), self.orig_pos.y()))
+            elif preset in ("右上", "右下"):
+                screen_width = QApplication.primaryScreen().geometry().width()
+                self.anim.setEndValue(QPoint(screen_width, self.orig_pos.y()))
             self.anim.start()
             self.hidden = True
         elif self.hidden and not r.contains(pos):
@@ -462,6 +536,7 @@ class OverlayWindow(QWidget):
             self.anim.setEndValue(self.orig_pos)
             self.anim.start()
             self.hidden = False
+        
 
     def closeEvent(self, event):
         if getattr(self, 'gpu_available', False):
@@ -480,7 +555,18 @@ class SystemTrayIcon(QSystemTrayIcon):
         self.setToolTip("CPNya")
 
         self.menu = QMenu()
-        self.menu.setStyleSheet("""
+        if darkdetect.isDark():
+            #深色模式
+            self.menu.setStyleSheet("""
+            QMenu { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2c2c2c, stop:1 #1e1e1e);
+                   border:1px solid #555; border-radius:8px; padding:5px; color:#ddd; }
+            QMenu::item { padding:8px 24px; margin:2px 0; border-radius:4px; font-size:13px; color:#ddd; }
+            QMenu::item:selected { background-color:#3498db; color:white; }
+            QMenu::separator { height:1px; background:#444; margin:4px 0; }
+        """)
+        else:
+            #浅色模式
+            self.menu.setStyleSheet("""
             QMenu { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #e6e6e6);
                    border:1px solid #aaa; border-radius:8px; padding:5px; }
             QMenu::item { padding:8px 24px; margin:2px 0; border-radius:4px; font-size:13px; color:#333; }
