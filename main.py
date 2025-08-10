@@ -308,7 +308,46 @@ class SettingsDialog(QDialog):
     def update_overlay_preview(self):
         if self.overlay:
             self.overlay.settings = self.get_settings()
-            self.overlay.update_info()
+            try:
+                self.overlay.update_info(force_reposition=True)
+            except TypeError:
+                try:
+                    self.overlay.adjust_position(force=True)
+                    self.overlay.update_info()
+                except Exception:
+                    self.overlay.update_info()
+
+    def accept(self):
+        settings = self.get_settings()
+        save_config(settings)
+        if self.overlay:
+            self.overlay.settings = settings
+            self.overlay.settings_dialog_open = False
+            try:
+                self.overlay.update_info(force_reposition=True)
+            except TypeError:
+                try:
+                    self.overlay.adjust_position(force=True)
+                    self.overlay.update_info()
+                except Exception:
+                    self.overlay.update_info()
+        super().accept()
+
+    def reject(self):
+        if self.overlay:
+            self.overlay.settings = load_config()
+            self.overlay.settings_dialog_open = False
+        try:
+            self.overlay.update_info(force_reposition=True)
+        except TypeError:
+            try:
+                self.overlay.adjust_position(force=True)
+                self.overlay.update_info()
+            except Exception:
+                self.overlay.update_info()
+        super().reject()
+
+
 
     def get_settings(self):
         settings = {
@@ -428,7 +467,16 @@ class OverlayWindow(QWidget):
 
         self.show()
 
-    def adjust_position(self):
+    def adjust_position(self, force: bool = False):
+        if not force:
+            if getattr(self, 'hidden', False) or getattr(self, 'settings_dialog_open', False):
+                return
+            if hasattr(self, 'anim') and self.anim.state() == QPropertyAnimation.Running:
+                return
+        else:
+            if hasattr(self, 'anim'):
+                self.anim.stop()
+            self.hidden = False
         self.adjustSize()
         geo = self.frameGeometry()
         screen_geo = QApplication.primaryScreen().geometry()
@@ -442,6 +490,8 @@ class OverlayWindow(QWidget):
             geo.moveTopRight(QPoint(screen_geo.right() - 10, 10))
         elif preset == "右下":
             geo.moveBottomRight(QPoint(screen_geo.right() - 10, screen_geo.bottom() - 10))
+        else:
+            geo.moveTopLeft(QPoint(10, 10))
 
         self.setGeometry(geo)
         self.orig_pos = self.pos()
@@ -509,8 +559,9 @@ class OverlayWindow(QWidget):
             parts.append(fps_str)
 
         self.label.setText("<br>".join(parts))
-        self.adjust_position()
         self.label.adjustSize()
+        if not getattr(self, 'hidden', False) and not (hasattr(self, 'anim') and self.anim.state() == QPropertyAnimation.Running):
+            self.adjust_position()
         self.adjustSize()
 
     def check_mouse(self):
@@ -518,9 +569,9 @@ class OverlayWindow(QWidget):
             return
         pos = QCursor.pos()
         m = 10
-        r = QRect(self.orig_pos.x(), self.orig_pos.y(), self.width(), self.height()).adjusted(-m, -m, m, m)
+        r = QRect(self.orig_pos, self.size()).adjusted(-m, -m, m, m)
         preset = self.settings.get('position_preset')
-        if not self.hidden and r.contains(pos):
+        if not getattr(self, 'hidden', False) and r.contains(pos):
             self.anim.stop()
             self.anim.setStartValue(self.pos())
             if preset in ("左上", "左下"):
@@ -530,7 +581,7 @@ class OverlayWindow(QWidget):
                 self.anim.setEndValue(QPoint(screen_width, self.orig_pos.y()))
             self.anim.start()
             self.hidden = True
-        elif self.hidden and not r.contains(pos):
+        elif getattr(self, 'hidden', False) and not r.contains(pos):
             self.anim.stop()
             self.anim.setStartValue(self.pos())
             self.anim.setEndValue(self.orig_pos)
